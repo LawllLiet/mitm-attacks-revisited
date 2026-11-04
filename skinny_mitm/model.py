@@ -1,29 +1,33 @@
-"""Gurobi skeleton for one SKINNY initial-structure position.
+"""Gurobi skeleton for one SKINNY-64/192 (z = 3) initial-structure position.
 
-The five colors are the five codes in Chen et al., Section 4.2. They are
-unambiguous there, so this module does not raise ``NotImplementedError`` for
-the color map. Open choices (tweakey lanes, AC placement, which cells are
-key DoF, how consumption bits are partitioned, the objective) are recorded
-in QUESTIONS.md and are not filled in with an attack search.
+Locked by the user
+------------------
+- Five colors only: blue (1,0,0), red (0,1,0), white (0,0,1), gray (0,0,0),
+  green (1,1,0). The codes (1,0,1), (0,1,1) and (1,1,1) are forbidden.
+- Blue adds one forward degree. Red adds one backward degree. White, gray
+  and green add zero. Gray is legal on an encryption cell. Green is legal
+  on a combined-tweakey cell and illegal on an encryption cell.
+- z = 3. On cells 0..7 the value equation is state XOR TK1 XOR TK2 XOR TK3.
+  The color model keeps one combined tweakey. AddConstants is a public
+  constant and is not a color variable: XOR with a constant preserves
+  (b, r, w). Each top cell therefore obeys the two-input XOR rule
+  post = pre XOR tk_top. Those eight top cells are linked, not key-DoF
+  variables. The n-XOR hull is not used here, because the three lanes are
+  not separate color variables; see QUESTIONS.md.
+- Key DoF is exactly the eight combined cells 8..15. Not three lanes, and
+  not the top two rows.
+- Objective is the constant 0. DoM is the rank formula, summed over four
+  columns. MC colors follow the SKINNY matrix cell by cell. No feed-forward
+  match and no guess-and-determine variables.
+- Remaining forward and backward degrees are integers and at least 1.
+  dL is stored separately and is not subtracted in those inequalities.
 
-What is encoded
----------------
-- Color variables ``(b, r, w)`` for the pre-ART state, the post-ART state,
-  and the lower two rows of each tweakey lane.
-- Encryption cells cannot be green. Key cells may be green.
-- One-way DoF counts a cell only when it is blue, or only when it is red.
-  Green is not counted. White and gray are not counted.
-- Encryption-state DoF is set equal to a consumption aggregate (fully
-  consumed). Forward/backward attack DoF are the remaining key-state DoF
-  and are constrained to be at least 1.
-- LIN cost uses ``APPROX_LIN_COST`` (0.5) times a binary indicator.
-- MC degree of matching is a lookup of the precomputed white-mask table.
-
-What is deliberately not encoded
---------------------------------
-No round objective, no hash mode, no sourcing function, no guess-and-determine
-encoders, and no automatic XOR link from X and Y onto tweakey lanes. Those
-depend on questions Q-Z, Q-AC, Q-DOF-SPLIT and Q-OBJ.
+Still open (QUESTIONS.md)
+-------------------------
+Whether both encryption states should be counted, how consumption bits are
+split against the Dong21 cross-accounting, the unnamed consumption bits, and
+whether a sixth n-XOR bullet exists. The piece index h0,h1,h2 is in the
+model; 4-bit neutral-word variables are not (Q-LIN-BITS).
 """
 
 from __future__ import annotations
@@ -42,6 +46,9 @@ from skinny_mitm.xor_rules import four_xor_hull, three_xor_hull, two_xor_hull
 # Re-exported so callers can cite the coarse charge next to the model.
 LIN_COST = APPROX_LIN_COST
 
+# SKINNY-64/192. The combined tweakey is TK1 XOR TK2 XOR TK3. Not a parameter.
+Z_TWEAK = 3
+
 
 @dataclass
 class Cell:
@@ -57,15 +64,33 @@ class Cell:
 
 
 @dataclass
+class SBoxLin:
+    """One S-box linearization: the cost bit and the one-hot affine piece."""
+
+    lin: gp.Var
+    h0: gp.Var
+    h1: gp.Var
+    h2: gp.Var
+
+
+@dataclass
 class InitialStructure:
-    """One ART-adjacent initial structure. ``n_tk`` is chosen by the caller."""
+    """ART-adjacent initial structure for combined TK1 XOR TK2 XOR TK3.
+
+    ``tk_bottom`` is the eight key-DoF cells (state indices 8..15).
+    ``tk_top`` is the eight combined cells on the ART rows. Their colors are
+    tied to the encryption states and are not part of the key-DoF sum.
+    """
 
     model: gp.Model
     round_index: int
-    n_tk: int
+    z: int
     pre_art: list
     post_art: list
-    tk_lower: list
+    tk_top: list
+    tk_bottom: list
+    art_cf: list
+    art_cb: list
     enc_forward: gp.LinExpr
     enc_backward: gp.LinExpr
     key_forward: gp.LinExpr
@@ -98,11 +123,14 @@ def _add_cell(model: gp.Model, name: str, allow_green: bool) -> Cell:
     b = model.addVar(vtype=GRB.BINARY, name=f"b_{name}")
     r = model.addVar(vtype=GRB.BINARY, name=f"r_{name}")
     w = model.addVar(vtype=GRB.BINARY, name=f"w_{name}")
-    # Five listed codes: forbid w together with b or r.
+    # Legal codes: (0,0,0) gray, (1,0,0) blue, (0,1,0) red, (0,0,1) white,
+    # and (1,1,0) green when allow_green is true.
+    # Forbid (1,0,1), (0,1,1) and (1,1,1).
     model.addConstr(b + w <= 1, name=f"color_{name}_bw")
     model.addConstr(r + w <= 1, name=f"color_{name}_rw")
     if not allow_green:
         # Encryption initial cells: green (1, 1, 0) is forbidden.
+        # Gray (0, 0, 0) stays feasible.
         model.addConstr(b + r <= 1, name=f"no_green_{name}")
     is_blue = model.addVar(vtype=GRB.BINARY, name=f"is_blue_{name}")
     is_red = model.addVar(vtype=GRB.BINARY, name=f"is_red_{name}")
@@ -123,49 +151,59 @@ def _sum_indicator(cells, attr: str) -> gp.LinExpr:
     return gp.quicksum(getattr(cell, attr) for cell in cells)
 
 
-def build_initial_structure_model(round_index: int, n_tk: int) -> InitialStructure:
-    """Build the color-and-DoF skeleton at ``round_index``.
+def build_initial_structure_model(round_index: int) -> InitialStructure:
+    """Build the z=3 color-and-DoF skeleton at ``round_index``.
 
-    ``n_tk`` is required and must be 1, 2 or 3. There is no default: the
-    SKINNY variant was not specified (Q-Z). For ``n_tk > 1`` the lower two
-    rows of every lane are included. That reading is flagged in Q-KEYDOF.
+    There is no tweakey-lane parameter. Key degrees come only from the eight
+    combined bottom cells.
     """
     if not isinstance(round_index, int) or isinstance(round_index, bool):
         raise TypeError("round_index must be an int")
     if round_index < 0:
         raise ValueError("round_index must be >= 0; no maximum round is assumed")
-    if n_tk not in (1, 2, 3):
-        raise ValueError("n_tk must be 1, 2 or 3; refusing to pick a SKINNY variant")
 
-    model = gp.Model(f"skinny_is_r{round_index}_z{n_tk}")
+    model = gp.Model(f"skinny_is_r{round_index}_z{Z_TWEAK}")
     model.Params.OutputFlag = 0
-    # No round-maximizing objective. The Chen objective is not installed (Q-OBJ).
+    # Constant objective. Rounds are not maximized.
     model.setObjective(0)
 
     pre = [_add_cell(model, f"pre_r{round_index}_{i}", allow_green=False) for i in range(N_CELLS)]
     post = [_add_cell(model, f"post_r{round_index}_{i}", allow_green=False) for i in range(N_CELLS)]
-    tk_lower = []
-    for lane in range(n_tk):
-        lane_cells = []
-        for state_i in lower_tk_indices():
-            lane_cells.append(
-                _add_cell(
-                    model,
-                    f"tk{lane}_lo_r{round_index}_{state_i}",
-                    allow_green=True,
-                )
-            )
-        tk_lower.append(lane_cells)
+    # Combined TK1 XOR TK2 XOR TK3. Green is allowed on both halves.
+    # Only the bottom half enters the key-DoF sum below.
+    tk_top = [
+        _add_cell(model, f"tk_hi_r{round_index}_{state_i}", allow_green=True)
+        for state_i in upper_art_indices()
+    ]
+    tk_bottom = [
+        _add_cell(model, f"tk_lo_r{round_index}_{state_i}", allow_green=True)
+        for state_i in lower_tk_indices()
+    ]
+    # Value-level ART is state XOR TK1 XOR TK2 XOR TK3. After the lanes are
+    # combined, and because a constant (AC) preserves color, each of cells
+    # 0..7 is the two-input rule post = pre XOR tk_top. The top cells are
+    # not given free colors outside this link, and they are not key DoF.
+    art_cf = []
+    art_cb = []
+    for offset, state_i in enumerate(upper_art_indices()):
+        cf, cb = add_two_xor(
+            model,
+            pre[state_i],
+            tk_top[offset],
+            post[state_i],
+            f"art_r{round_index}_{state_i}",
+        )
+        art_cf.append(cf)
+        art_cb.append(cb)
 
     enc_cells = pre + post
-    key_cells = [cell for lane in tk_lower for cell in lane]
-    # FLAGGED (Q-ENCDOF): both encryption states are summed. This may double-count
+    # OPEN (Q-ENCDOF): both encryption states are summed. This may double-count
     # neutral words that ART ties together. Green is excluded by is_blue / is_red.
     enc_forward = _sum_indicator(enc_cells, "is_blue")
     enc_backward = _sum_indicator(enc_cells, "is_red")
-    # FLAGGED (Q-KEYDOF): key DoF is the blue/red count on the included lower rows.
-    key_forward = _sum_indicator(key_cells, "is_blue")
-    key_backward = _sum_indicator(key_cells, "is_red")
+    # Key DoF is these eight combined bottom cells only.
+    key_forward = _sum_indicator(tk_bottom, "is_blue")
+    key_backward = _sum_indicator(tk_bottom, "is_red")
 
     consumed_enc_forward = model.addVar(lb=0, vtype=GRB.INTEGER, name="consumed_enc_forward")
     consumed_enc_backward = model.addVar(lb=0, vtype=GRB.INTEGER, name="consumed_enc_backward")
@@ -177,8 +215,9 @@ def build_initial_structure_model(round_index: int, n_tk: int) -> InitialStructu
     # Encryption-state initial DoF is fully consumed.
     model.addConstr(consumed_enc_forward == enc_forward, name="enc_forward_fully_consumed")
     model.addConstr(consumed_enc_backward == enc_backward, name="enc_backward_fully_consumed")
-    # Attack DoF is the remaining key-state DoF. For an integer this is the MILP
-    # form of "> 0". dL is NOT subtracted here (Q-POS).
+    # Remaining key DoF, as integers. "> 0" is encoded by ">= 1".
+    # dL is not subtracted here.
+    # art_cf / art_cb are not wired in: which pool they debit is Q-DOF-SPLIT.
     model.addConstr(forward_dof == key_forward - consumed_key_forward, name="forward_dof_remaining_key")
     model.addConstr(backward_dof == key_backward - consumed_key_backward, name="backward_dof_remaining_key")
     model.addConstr(forward_dof >= 1, name="forward_dof_positive")
@@ -188,10 +227,13 @@ def build_initial_structure_model(round_index: int, n_tk: int) -> InitialStructu
     structure = InitialStructure(
         model=model,
         round_index=round_index,
-        n_tk=n_tk,
+        z=Z_TWEAK,
         pre_art=pre,
         post_art=post,
-        tk_lower=tk_lower,
+        tk_top=tk_top,
+        tk_bottom=tk_bottom,
+        art_cf=art_cf,
+        art_cb=art_cb,
         enc_forward=enc_forward,
         enc_backward=enc_backward,
         key_forward=key_forward,
@@ -254,14 +296,23 @@ def link_consumption(
             model.addConstr(aggregate == gp.quicksum(bits), name=name)
 
 
-def add_sbox(structure: InitialStructure, inp: Cell, out: Cell, name: str) -> gp.Var:
-    """Paper SB-rule plus one binary whose coarse cost is ``APPROX_LIN_COST``."""
-    lin = structure.model.addVar(vtype=GRB.BINARY, name=f"lin_{name}")
+def add_sbox(structure: InitialStructure, inp: Cell, out: Cell, name: str) -> SBoxLin:
+    """Paper SB color rule, plus a one-hot affine-piece index.
+
+    ``h0 + h1 + h2 = lin``. The coarse cost is ``APPROX_LIN_COST`` per ``lin``.
+    No 4-bit neutral-word variables are created.
+    """
+    model = structure.model
+    lin = model.addVar(vtype=GRB.BINARY, name=f"lin_{name}")
+    h0 = model.addVar(vtype=GRB.BINARY, name=f"h0_{name}")
+    h1 = model.addVar(vtype=GRB.BINARY, name=f"h1_{name}")
+    h2 = model.addVar(vtype=GRB.BINARY, name=f"h2_{name}")
+    model.addConstr(h0 + h1 + h2 == lin, name=f"piece_{name}")
     variables = (*inp.bits(), *out.bits(), lin)
-    _add_hrep(structure.model, sb_hull(), variables, f"sb_{name}")
+    _add_hrep(model, sb_hull(), variables, f"sb_{name}")
     structure.lin_vars.append(lin)
     _refresh_dl(structure)
-    return lin
+    return SBoxLin(lin, h0, h1, h2)
 
 
 def add_two_xor(model: gp.Model, left: Cell, right: Cell, out: Cell, name: str):
@@ -369,5 +420,5 @@ def add_state_dom(model: gp.Model, column_doms, name: str = "state_dom") -> gp.V
 
 
 def art_cell_indices():
-    """Document the cells ART writes. Not a guess about AC."""
+    """Cells 0..7. ART writes these and no others. AC is not a color input."""
     return upper_art_indices()

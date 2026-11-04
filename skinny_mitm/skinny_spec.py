@@ -21,10 +21,12 @@ with rc0 the least significant bit. ``SPEC_RC_TABLE`` is the 62 constants
 printed in that paper; the LFSR is checked against the table rather than
 trusted alone.
 
-The value identity ``TK_top = X XOR Y XOR AC`` is the user's working
-hypothesis. It is implemented and flagged. If X is the state immediately
-after AddConstants, the specification says ``Y = X XOR TK_top`` on the first
-two rows, so AC must not be XORed again. See QUESTIONS.md Q-AC.
+AddConstants is a public constant. XOR with a constant does not change a
+cell's ``(b, r, w)`` color, so the MILP does not contain an AC mask. The
+value-level helper ``implied_tk_top`` still accepts an AC mask for numerical
+checks. On the first two rows the color model links the combined tweakey by
+the two-input XOR rule, which is the color image of
+``state XOR TK1 XOR TK2 XOR TK3`` after the three lanes have been combined.
 """
 
 from __future__ import annotations
@@ -103,12 +105,12 @@ def skinny64_ac_mask(round_1based: int):
 
 
 def implied_tk_top(pre_art, post_art, ac_mask):
-    """User hypothesis, flagged: TK_top = X XOR Y XOR AC on the first two rows.
+    """Value-level helper: TK_top = X XOR Y XOR AC on the first two rows.
 
     ``pre_art``, ``post_art`` and ``ac_mask`` are 16-cell sequences.
     Only the eight cells of rows 0 and 1 are returned, in row-major order.
-    This does not decide whether AC sits between X and Y; pass a zero mask
-    if X is already the post-AC state. See QUESTIONS.md Q-AC.
+    The color MILP does not call this. A constant XOR preserves ``(b, r, w)``,
+    so pass a zero mask when only the color-level identity is needed.
     """
     if not (len(pre_art) == len(post_art) == len(ac_mask) == N_CELLS):
         raise ValueError("X, Y and AC must each have 16 cells")

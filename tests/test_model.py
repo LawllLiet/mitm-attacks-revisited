@@ -5,7 +5,7 @@ import unittest
 import gurobipy as gp
 from gurobipy import GRB
 
-from skinny_mitm.colors import BLUE, GRAY, GREEN, RED, WHITE
+from skinny_mitm.colors import BLUE, EXCLUDED_CODES, GRAY, GREEN, RED, VALID_COLORS, WHITE
 from skinny_mitm.mc_dom import column_dom, state_dom
 from skinny_mitm.model import (
     _add_cell,
@@ -21,6 +21,8 @@ from skinny_mitm.model import (
 )
 from skinny_mitm.sbox_lin import APPROX_LIN_COST
 
+ALL_CODES = tuple((b, r, w) for b in (0, 1) for r in (0, 1) for w in (0, 1))
+
 
 def _fix(model, cell, color):
     b, r, w = color
@@ -34,9 +36,15 @@ def _paint(structure, enc_color=GRAY, key_color=GRAY, overrides=None):
     model = structure.model
     for cell in structure.pre_art + structure.post_art:
         _fix(model, cell, overrides.get(cell.name, enc_color))
-    for lane in structure.tk_lower:
-        for cell in lane:
-            _fix(model, cell, overrides.get(cell.name, key_color))
+    for cell in structure.tk_bottom:
+        _fix(model, cell, overrides.get(cell.name, key_color))
+    for cell in structure.tk_top:
+        if cell.name in overrides:
+            _fix(model, cell, overrides[cell.name])
+
+
+def _expect_indicators(code):
+    return (1 if code == BLUE else 0, 1 if code == RED else 0)
 
 
 def _bare(name="bare"):
@@ -46,67 +54,103 @@ def _bare(name="bare"):
 
 
 class InitialStructureTests(unittest.TestCase):
-    def test_variant_and_round_are_not_defaulted(self):
+    def test_z3_has_no_lane_parameter(self):
         with self.assertRaises(TypeError):
-            build_initial_structure_model(0)
-        with self.assertRaises(ValueError):
-            build_initial_structure_model(0, 4)
-        with self.assertRaises(ValueError):
-            build_initial_structure_model(-1, 1)
+            build_initial_structure_model()
         with self.assertRaises(TypeError):
-            build_initial_structure_model(True, 1)
+            build_initial_structure_model(0, 3)
+        with self.assertRaises(ValueError):
+            build_initial_structure_model(-1)
+        with self.assertRaises(TypeError):
+            build_initial_structure_model(True)
+        structure = build_initial_structure_model(2)
+        self.assertEqual(structure.z, 3)
+        self.assertEqual(structure.round_index, 2)
+        self.assertEqual(len(structure.pre_art), 16)
+        self.assertEqual(len(structure.post_art), 16)
+        self.assertEqual(len(structure.tk_bottom), 8)
+        self.assertEqual(len(structure.tk_top), 8)
+        self.assertEqual(len(structure.art_cf), 8)
+        self.assertFalse(hasattr(structure, "n_tk"))
+        self.assertFalse(hasattr(structure, "tk_lower"))
+        self.assertEqual(structure.model.getObjective().size(), 0)
 
-    def test_cell_counts_for_one_and_three_lanes(self):
-        one = build_initial_structure_model(0, 1)
-        three = build_initial_structure_model(2, 3)
-        self.assertEqual(len(one.pre_art), 16)
-        self.assertEqual(len(one.post_art), 16)
-        self.assertEqual(len(one.tk_lower), 1)
-        self.assertEqual(len(one.tk_lower[0]), 8)
-        self.assertEqual(len(three.tk_lower), 3)
-        self.assertEqual(sum(len(lane) for lane in three.tk_lower), 24)
-        self.assertEqual(one.model.getObjective().size(), 0)
-        self.assertEqual(three.round_index, 2)
-        self.assertEqual(three.n_tk, 3)
+    def test_only_the_five_color_tuples_are_feasible(self):
+        for allow_green in (True, False):
+            legal = VALID_COLORS if allow_green else tuple(code for code in VALID_COLORS if code != GREEN)
+            self.assertEqual(len(legal), 5 if allow_green else 4)
+            for code in ALL_CODES:
+                model = _bare(f"color_{allow_green}_{code}")
+                cell = _add_cell(model, "c", allow_green)
+                _fix(model, cell, code)
+                model.optimize()
+                if code in legal:
+                    self.assertEqual(model.Status, GRB.OPTIMAL, code)
+                    blue, red = _expect_indicators(code)
+                    self.assertEqual(int(round(cell.is_blue.X)), blue)
+                    self.assertEqual(int(round(cell.is_red.X)), red)
+                else:
+                    self.assertEqual(model.Status, GRB.INFEASIBLE, code)
+        self.assertEqual(set(EXCLUDED_CODES), {(1, 0, 1), (0, 1, 1), (1, 1, 1)})
+        self.assertEqual(
+            set(VALID_COLORS),
+            {BLUE, RED, WHITE, GRAY, GREEN},
+        )
+        self.assertEqual(BLUE, (1, 0, 0))
+        self.assertEqual(RED, (0, 1, 0))
+        self.assertEqual(WHITE, (0, 0, 1))
+        self.assertEqual(GRAY, (0, 0, 0))
+        self.assertEqual(GREEN, (1, 1, 0))
 
     def test_objective_stays_zero(self):
-        structure = build_initial_structure_model(1, 1)
+        structure = build_initial_structure_model(1)
         _paint(
             structure,
             overrides={
-                structure.tk_lower[0][0].name: BLUE,
-                structure.tk_lower[0][1].name: RED,
+                structure.tk_bottom[0].name: BLUE,
+                structure.tk_bottom[1].name: RED,
             },
         )
         structure.model.optimize()
         self.assertEqual(structure.model.Status, GRB.OPTIMAL)
         self.assertEqual(structure.model.ObjVal, 0.0)
 
-    def test_encryption_cell_cannot_be_green(self):
-        structure = build_initial_structure_model(0, 1)
-        cell = structure.pre_art[3]
-        _fix(structure.model, cell, GREEN)
-        structure.model.optimize()
-        self.assertEqual(structure.model.Status, GRB.INFEASIBLE)
+    def test_encryption_cell_cannot_be_green_and_key_bottom_can(self):
+        blocked = build_initial_structure_model(0)
+        _fix(blocked.model, blocked.pre_art[15], GREEN)
+        blocked.model.optimize()
+        self.assertEqual(blocked.model.Status, GRB.INFEASIBLE)
 
-    def test_excluded_color_code_is_infeasible_on_a_key_cell(self):
-        structure = build_initial_structure_model(0, 1)
-        cell = structure.tk_lower[0][0]
-        _fix(structure.model, cell, (1, 0, 1))
-        structure.model.optimize()
-        self.assertEqual(structure.model.Status, GRB.INFEASIBLE)
+        allowed = build_initial_structure_model(0)
+        bottom = allowed.tk_bottom
+        _paint(
+            allowed,
+            GRAY,
+            GRAY,
+            {bottom[0].name: GREEN, bottom[1].name: BLUE, bottom[2].name: RED},
+        )
+        link_consumption(allowed, key_forward_bits=[], key_backward_bits=[])
+        allowed.model.optimize()
+        self.assertEqual(allowed.model.Status, GRB.OPTIMAL)
+        self.assertEqual(int(round(bottom[0].b.X)), 1)
+        self.assertEqual(int(round(bottom[0].r.X)), 1)
+        self.assertEqual(int(round(bottom[0].w.X)), 0)
+        self.assertEqual(int(round(bottom[0].is_blue.X)), 0)
+        self.assertEqual(int(round(bottom[0].is_red.X)), 0)
+        self.assertEqual(int(round(allowed.forward_dof.X)), 1)
+        self.assertEqual(int(round(allowed.backward_dof.X)), 1)
 
-    def test_all_gray_key_is_infeasible(self):
-        structure = build_initial_structure_model(0, 1)
-        _paint(structure, GRAY, GRAY)
-        structure.model.optimize()
-        self.assertEqual(structure.model.Status, GRB.INFEASIBLE)
-
-    def test_one_blue_and_one_red_key_cell_is_feasible(self):
-        structure = build_initial_structure_model(0, 3)
-        blue = structure.tk_lower[2][0]
-        red = structure.tk_lower[0][7]
-        _paint(structure, GRAY, GRAY, {blue.name: BLUE, red.name: RED})
+    def test_gray_encryption_cell_is_feasible(self):
+        structure = build_initial_structure_model(0)
+        _paint(
+            structure,
+            GRAY,
+            GRAY,
+            {
+                structure.tk_bottom[0].name: BLUE,
+                structure.tk_bottom[1].name: RED,
+            },
+        )
         link_consumption(
             structure,
             enc_forward_bits=[],
@@ -116,49 +160,85 @@ class InitialStructureTests(unittest.TestCase):
         )
         structure.model.optimize()
         self.assertEqual(structure.model.Status, GRB.OPTIMAL)
+        cell = structure.pre_art[15]
+        self.assertEqual((int(round(cell.b.X)), int(round(cell.r.X)), int(round(cell.w.X))), GRAY)
         self.assertEqual(int(round(structure.forward_dof.X)), 1)
         self.assertEqual(int(round(structure.backward_dof.X)), 1)
-        self.assertEqual(int(round(structure.consumed_key_forward.X)), 0)
-        self.assertEqual(int(round(structure.consumed_key_backward.X)), 0)
         self.assertEqual(int(round(structure.consumed_enc_forward.X)), 0)
-        self.assertEqual(int(round(structure.consumed_enc_backward.X)), 0)
-        self.assertAlmostEqual(structure.dL.X, 0.0)
 
-    def test_green_key_cell_adds_neither_forward_nor_backward_dof(self):
-        structure = build_initial_structure_model(0, 1)
-        lane = structure.tk_lower[0]
-        _paint(
-            structure,
-            GRAY,
-            GRAY,
-            {lane[0].name: GREEN, lane[1].name: BLUE, lane[2].name: RED},
-        )
-        link_consumption(
-            structure,
-            key_forward_bits=[],
-            key_backward_bits=[],
-        )
+    def test_key_dof_uses_exactly_eight_combined_bottom_cells(self):
+        structure = build_initial_structure_model(0)
+        overrides = {structure.tk_bottom[7].name: RED}
+        for cell in structure.tk_bottom[:7]:
+            overrides[cell.name] = BLUE
+        # A blue top cell is linked by ART and must not add a key degree.
+        overrides[structure.pre_art[0].name] = GRAY
+        overrides[structure.post_art[0].name] = BLUE
+        overrides[structure.tk_top[0].name] = BLUE
+        _paint(structure, GRAY, GRAY, overrides)
+        link_consumption(structure, key_forward_bits=[], key_backward_bits=[])
         structure.model.optimize()
         self.assertEqual(structure.model.Status, GRB.OPTIMAL)
-        self.assertEqual(int(round(lane[0].b.X)), 1)
-        self.assertEqual(int(round(lane[0].r.X)), 1)
-        self.assertEqual(int(round(lane[0].w.X)), 0)
-        self.assertEqual(int(round(lane[0].is_blue.X)), 0)
-        self.assertEqual(int(round(lane[0].is_red.X)), 0)
-        self.assertEqual(int(round(structure.forward_dof.X)), 1)
+        self.assertEqual(int(round(structure.tk_top[0].is_blue.X)), 1)
+        self.assertEqual(int(round(structure.forward_dof.X)), 7)
         self.assertEqual(int(round(structure.backward_dof.X)), 1)
+        self.assertEqual(sum(int(round(cell.is_blue.X)) for cell in structure.tk_bottom), 7)
+        self.assertEqual(sum(int(round(cell.is_red.X)) for cell in structure.tk_bottom), 1)
 
-    def test_encryption_dof_must_be_consumed(self):
-        structure = build_initial_structure_model(0, 1)
-        lane = structure.tk_lower[0]
+    def test_art_top_link_is_two_input_xor_and_does_not_spend_key_dof(self):
+        structure = build_initial_structure_model(0)
         _paint(
             structure,
             GRAY,
             GRAY,
             {
                 structure.pre_art[0].name: BLUE,
-                lane[0].name: BLUE,
-                lane[1].name: RED,
+                structure.tk_top[0].name: BLUE,
+                structure.post_art[0].name: GRAY,
+                structure.tk_bottom[0].name: BLUE,
+                structure.tk_bottom[1].name: RED,
+            },
+        )
+        link_consumption(structure, key_forward_bits=[], key_backward_bits=[])
+        structure.model.optimize()
+        self.assertEqual(structure.model.Status, GRB.OPTIMAL)
+        self.assertEqual(int(round(structure.art_cf[0].X)), 1)
+        self.assertEqual(int(round(structure.art_cb[0].X)), 0)
+        self.assertEqual(int(round(structure.forward_dof.X)), 1)
+
+        rejected = build_initial_structure_model(1)
+        _paint(
+            rejected,
+            GRAY,
+            GRAY,
+            {
+                rejected.pre_art[0].name: WHITE,
+                rejected.post_art[0].name: BLUE,
+                rejected.tk_bottom[0].name: BLUE,
+                rejected.tk_bottom[1].name: RED,
+            },
+        )
+        rejected.model.optimize()
+        self.assertEqual(rejected.model.Status, GRB.INFEASIBLE)
+
+    def test_all_gray_key_is_infeasible(self):
+        structure = build_initial_structure_model(0)
+        _paint(structure, GRAY, GRAY)
+        structure.model.optimize()
+        self.assertEqual(structure.model.Status, GRB.INFEASIBLE)
+
+    def test_encryption_dof_must_be_consumed(self):
+        structure = build_initial_structure_model(0)
+        _paint(
+            structure,
+            GRAY,
+            GRAY,
+            {
+                structure.pre_art[0].name: BLUE,
+                structure.post_art[0].name: GRAY,
+                structure.tk_top[0].name: BLUE,
+                structure.tk_bottom[0].name: BLUE,
+                structure.tk_bottom[1].name: RED,
             },
         )
         link_consumption(
@@ -171,39 +251,45 @@ class InitialStructureTests(unittest.TestCase):
         structure.model.optimize()
         self.assertEqual(structure.model.Status, GRB.INFEASIBLE)
 
-    def test_lin_charge_is_half_per_indicator(self):
-        structure = build_initial_structure_model(4, 1)
-        lane = structure.tk_lower[0]
-        lin_keep = add_sbox(structure, lane[0], lane[1], "keep")
-        lin_drop = add_sbox(structure, lane[2], lane[3], "drop")
+    def test_lin_one_hot_sums_to_lin_and_costs_one_half(self):
+        structure = build_initial_structure_model(4)
+        bottom = structure.tk_bottom
+        kept = add_sbox(structure, bottom[0], bottom[1], "keep")
+        dropped = add_sbox(structure, bottom[2], bottom[3], "drop")
         _paint(
             structure,
             GRAY,
             GRAY,
             {
-                lane[0].name: GREEN,
-                lane[1].name: GREEN,
-                lane[2].name: GREEN,
-                lane[3].name: WHITE,
-                lane[4].name: BLUE,
-                lane[5].name: RED,
+                bottom[0].name: GREEN,
+                bottom[1].name: GREEN,
+                bottom[2].name: GREEN,
+                bottom[3].name: WHITE,
+                bottom[4].name: BLUE,
+                bottom[5].name: RED,
             },
         )
         structure.model.optimize()
         self.assertEqual(structure.model.Status, GRB.OPTIMAL)
         self.assertEqual(APPROX_LIN_COST, 0.5)
-        self.assertEqual(int(round(lin_keep.X)), 1)
-        self.assertEqual(int(round(lin_drop.X)), 0)
+        self.assertEqual(int(round(kept.lin.X)), 1)
+        self.assertEqual(int(round(dropped.lin.X)), 0)
+        for piece in (kept, dropped):
+            bits = [int(round(piece.h0.X)), int(round(piece.h1.X)), int(round(piece.h2.X))]
+            self.assertEqual(sum(bits), int(round(piece.lin.X)))
+            self.assertTrue(all(bit in (0, 1) for bit in bits))
+        self.assertEqual(
+            [int(round(kept.h0.X)), int(round(kept.h1.X)), int(round(kept.h2.X))].count(1),
+            1,
+        )
         self.assertAlmostEqual(structure.dL.X, 0.5)
-        # Forcing the kept-green branch to skip its indicator violates the SB-rule.
-        structure.model.addConstr(lin_keep == 0)
+        structure.model.addConstr(kept.h0 + kept.h1 + kept.h2 == 0)
         structure.model.optimize()
         self.assertEqual(structure.model.Status, GRB.INFEASIBLE)
 
     def test_non_green_sbox_cannot_pay_for_linearization(self):
-        structure = build_initial_structure_model(0, 1)
-        lin = add_sbox(structure, structure.pre_art[0], structure.post_art[0], "pass")
-        lane = structure.tk_lower[0]
+        structure = build_initial_structure_model(0)
+        piece = add_sbox(structure, structure.pre_art[0], structure.post_art[0], "pass")
         _paint(
             structure,
             GRAY,
@@ -211,15 +297,16 @@ class InitialStructureTests(unittest.TestCase):
             {
                 structure.pre_art[0].name: BLUE,
                 structure.post_art[0].name: BLUE,
-                lane[0].name: BLUE,
-                lane[1].name: RED,
+                structure.tk_bottom[0].name: BLUE,
+                structure.tk_bottom[1].name: RED,
             },
         )
         structure.model.optimize()
         self.assertEqual(structure.model.Status, GRB.OPTIMAL)
-        self.assertEqual(int(round(lin.X)), 0)
+        self.assertEqual(int(round(piece.lin.X)), 0)
+        self.assertEqual(int(round(piece.h0.X + piece.h1.X + piece.h2.X)), 0)
         self.assertAlmostEqual(structure.dL.X, 0.0)
-        structure.model.addConstr(lin == 1)
+        structure.model.addConstr(piece.lin == 1)
         structure.model.optimize()
         self.assertEqual(structure.model.Status, GRB.INFEASIBLE)
 

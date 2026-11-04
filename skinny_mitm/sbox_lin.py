@@ -14,6 +14,11 @@ incremented by one)."
 
 The per-S-box weight of that one cost is NOT the AES value. The user fixed
 it at (1/4)*log2(3), with a coarse Gurobi charge of 1/2.
+
+``model.add_sbox`` adds the binary ``lin`` from this rule and a one-hot piece
+index ``h0, h1, h2`` with ``h0 + h1 + h2 = lin``. The three affine maps stay
+in this module as tested functions. They are not expanded into 4-bit MILP
+variables; that choice is QUESTIONS.md item Q-LIN-BITS.
 """
 
 from __future__ import annotations

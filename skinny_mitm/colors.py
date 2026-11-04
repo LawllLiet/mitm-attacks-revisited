@@ -8,10 +8,11 @@ Quoted from the paper (Color-encoding Scheme of Neutral Words):
 - A gray cell denotes a constant byte, encoded as (b, r, w) = (0, 0, 0).
 - A green cell denotes a superposition byte, encoded as (b, r, w) = (1, 1, 0).
 
-The paper assigns no meaning to (1, 0, 1), (0, 1, 1) or (1, 1, 1). Together with
-the requirement that each cell has five color choices, those three codes are
-excluded. See QUESTIONS.md, item Q-COLOR, which records that this exclusion is
-the reading of the five listed codes and not a sixth color.
+The paper assigns no meaning to (1, 0, 1), (0, 1, 1) or (1, 1, 1). The user
+locked these five codes as the only legal colors, so those three triples are
+forbidden by constraints. Blue adds one forward degree, red adds one backward
+degree, and white, gray, and green add zero. Gray is a legal encryption color.
+Green is legal only on combined-tweakey cells.
 """
 
 from __future__ import annotations

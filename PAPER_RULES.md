@@ -2,6 +2,8 @@
 
 Source: Shiyao Chen, Jian Guo, Eik List, Danping Shi, Tianyu Zhang, “Diving Deep into the Preimage Security of AES-like Hashing”, ePrint 2024/300, Section 4.2. The PDF URL returned 403. The quotations below are the extracted sentences with line-break hyphens removed. They are the sentences the code follows. A rule that was not in the extract is listed at the end and is not implemented.
 
+Decisions locked after that extract are in QUESTIONS.md: z=3, eight combined tweakey cells, constant XOR preserves color, rank-DoM, cellwise SKINNY MixColumns, no feed-forward match, no guess-and-determine, objective 0, and integer DoF at least 1 without subtracting dL. The missing sixth n-XOR bullet is still open.
+
 ## Color encoding
 
 > A blue cell denotes a forward neutral byte, encoded as (b, r, w) = (1, 0, 0).
